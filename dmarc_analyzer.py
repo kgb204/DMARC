@@ -97,10 +97,76 @@ class SourceStats:
     raw_dkim_pass: int = 0    # raw auth passed even if unaligned (forwarders)
     raw_spf_pass: int = 0
     hostname: str = ""
+    auth_domains: set = field(default_factory=set)  # domains seen in auth_results
+    service: str = ""         # identified sending service ("" = unidentified)
 
     @property
     def fail(self) -> int:
         return self.total - self.dmarc_pass
+
+
+# ---------------------------------------------------------------------------
+# Sender intelligence: map source IPs to known sending services
+# ---------------------------------------------------------------------------
+
+# Best-effort IP prefix map for the largest senders (prefixes end with ".").
+IP_PREFIXES = [
+    ("209.85.", "Google Workspace / Gmail"), ("172.217.", "Google Workspace / Gmail"),
+    ("35.190.", "Google Workspace / Gmail"), ("64.233.", "Google Workspace / Gmail"),
+    ("66.102.", "Google Workspace / Gmail"), ("74.125.", "Google Workspace / Gmail"),
+    ("108.177.", "Google Workspace / Gmail"), ("142.250.", "Google Workspace / Gmail"),
+    ("142.251.", "Google Workspace / Gmail"), ("173.194.", "Google Workspace / Gmail"),
+    ("40.92.", "Microsoft 365 / Outlook"), ("40.107.", "Microsoft 365 / Outlook"),
+    ("52.100.", "Microsoft 365 / Outlook"), ("52.101.", "Microsoft 365 / Outlook"),
+    ("52.102.", "Microsoft 365 / Outlook"), ("52.103.", "Microsoft 365 / Outlook"),
+    ("104.47.", "Microsoft 365 / Outlook"),
+    ("54.240.", "Amazon SES"), ("23.249.208.", "Amazon SES"),
+    ("167.89.", "SendGrid"), ("168.245.", "SendGrid"), ("149.72.", "SendGrid"),
+    ("159.135.", "Mailgun"), ("69.72.", "Mailgun"),
+]
+
+# rDNS hostname / DKIM-SPF domain suffixes that identify a sending service.
+SERVICE_SIGNATURES = [
+    ("google.com", "Google Workspace / Gmail"), ("googlemail.com", "Google Workspace / Gmail"),
+    ("outlook.com", "Microsoft 365 / Outlook"), ("protection.outlook.com", "Microsoft 365 / Outlook"),
+    ("onmicrosoft.com", "Microsoft 365 / Outlook"),
+    ("amazonses.com", "Amazon SES"), ("smtp-out.amazonses.com", "Amazon SES"),
+    ("sendgrid.net", "SendGrid"), ("sendgrid.info", "SendGrid"),
+    ("mailgun.org", "Mailgun"), ("mailgun.net", "Mailgun"),
+    ("mcsv.net", "Mailchimp"), ("mcdlv.net", "Mailchimp"), ("rsgsv.net", "Mailchimp"),
+    ("mandrillapp.com", "Mandrill / Mailchimp Transactional"),
+    ("sparkpostmail.com", "SparkPost"),
+    ("mtasv.net", "Postmark"), ("postmarkapp.com", "Postmark"),
+    ("sendinblue.com", "Brevo (Sendinblue)"), ("brevo.com", "Brevo (Sendinblue)"),
+    ("hubspotemail.net", "HubSpot"),
+    ("exacttarget.com", "Salesforce Marketing Cloud"), ("salesforce.com", "Salesforce"),
+    ("zendesk.com", "Zendesk"),
+    ("pphosted.com", "Proofpoint"), ("ppe-hosted.com", "Proofpoint"),
+    ("mimecast.com", "Mimecast"),
+    ("messagelabs.com", "Broadcom/Symantec.cloud"),
+    ("constantcontact.com", "Constant Contact"),
+    ("icloud.com", "Apple iCloud"), ("me.com", "Apple iCloud"),
+    ("yahoodns.net", "Yahoo"), ("yahoo.com", "Yahoo"),
+    ("zoho.com", "Zoho Mail"), ("zohomail.com", "Zoho Mail"),
+    ("fastmail.com", "Fastmail"), ("messagingengine.com", "Fastmail"),
+]
+
+
+def identify_service(s: SourceStats, own_domains: set) -> str:
+    """Best-effort identification of which service a source IP belongs to."""
+    for prefix, name in IP_PREFIXES:
+        if s.ip.startswith(prefix):
+            return name
+    third_party = sorted(d for d in s.auth_domains if d and d not in own_domains)
+    for host in ([s.hostname] if s.hostname else []) + third_party:
+        host = host.lower().rstrip(".")
+        for suffix, name in SERVICE_SIGNATURES:
+            if host == suffix or host.endswith("." + suffix):
+                return name
+    # Unrecognized, but the signing/envelope domain itself is still a useful label.
+    if third_party:
+        return third_party[0]
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +296,9 @@ class Analysis:
     sources: dict               # ip -> SourceStats
     total: int = 0
     dmarc_pass: int = 0
+    dkim_aligned: int = 0
+    spf_aligned: int = 0
+    daily: dict = field(default_factory=dict)   # date -> [total, pass]
     skipped: list = field(default_factory=list)
 
     @property
@@ -266,23 +335,59 @@ def analyze(reports: list) -> Analysis:
 
     analysis = Analysis(reports=unique, sources={})
     for report in unique:
+        day = report.begin.date()
+        bucket = analysis.daily.setdefault(day, [0, 0])
         for rec in report.records:
             s = analysis.sources.setdefault(rec.source_ip, SourceStats(ip=rec.source_ip))
             s.total += rec.count
             analysis.total += rec.count
+            bucket[0] += rec.count
             if rec.dmarc_pass:
                 s.dmarc_pass += rec.count
                 analysis.dmarc_pass += rec.count
+                bucket[1] += rec.count
             if rec.dkim_aligned:
                 s.dkim_aligned += rec.count
+                analysis.dkim_aligned += rec.count
             if rec.spf_aligned:
                 s.spf_aligned += rec.count
+                analysis.spf_aligned += rec.count
             if any(res == "pass" for _, res in rec.dkim_auth_results):
                 s.raw_dkim_pass += rec.count
             if any(res == "pass" for _, res in rec.spf_auth_results):
                 s.raw_spf_pass += rec.count
             s.dispositions[rec.disposition] = s.dispositions.get(rec.disposition, 0) + rec.count
+            s.auth_domains.update(d for d, _ in rec.dkim_auth_results)
+            s.auth_domains.update(d for d, _ in rec.spf_auth_results)
+
+    own_domains = {r.domain for r in unique}
+    for s in analysis.sources.values():
+        s.service = identify_service(s, own_domains)
     return analysis
+
+
+def service_breakdown(a: Analysis) -> list:
+    """Group sources by identified sending service, largest volume first."""
+    groups = {}
+    for s in a.sources.values():
+        g = groups.setdefault(s.service or "Unidentified", [0, 0, 0])  # sources, total, pass
+        g[0] += 1
+        g[1] += s.total
+        g[2] += s.dmarc_pass
+    return sorted(groups.items(), key=lambda kv: kv[1][1], reverse=True)
+
+
+def suspected_spoofing(a: Analysis) -> list:
+    """Sources with failures and no valid authentication at all — likely abuse.
+
+    These never produced a single passing DKIM signature or SPF check (raw,
+    not just aligned), so they are very unlikely to be your infrastructure.
+    p=reject exists to stop exactly this traffic.
+    """
+    return sorted(
+        (s for s in a.sources.values()
+         if s.fail > 0 and s.raw_dkim_pass == 0 and s.raw_spf_pass == 0),
+        key=lambda s: s.fail, reverse=True)
 
 
 # Thresholds for the rollout recommendation.
@@ -348,11 +453,15 @@ def recommend(a: Analysis) -> list:
 # ---------------------------------------------------------------------------
 
 def resolve_hostnames(a: Analysis) -> None:
+    own_domains = {r.domain for r in a.reports}
     for s in a.sources.values():
         try:
             s.hostname = socket.gethostbyaddr(s.ip)[0]
         except OSError:
             s.hostname = "(no rDNS)"
+            continue
+        # rDNS may identify a service that auth domains couldn't.
+        s.service = identify_service(s, own_domains)
 
 
 def render_text(a: Analysis) -> str:
@@ -370,16 +479,38 @@ def render_text(a: Analysis) -> str:
     w(f"Total messages:   {a.total}")
     w(f"DMARC pass:       {a.dmarc_pass} ({a.pass_rate:.2f}%)")
     w(f"DMARC fail:       {a.total - a.dmarc_pass}")
+    if a.total:
+        w(f"DKIM aligned:     {a.dkim_aligned} ({100.0 * a.dkim_aligned / a.total:.2f}%)")
+        w(f"SPF aligned:      {a.spf_aligned} ({100.0 * a.spf_aligned / a.total:.2f}%)")
     w("")
-    w(f"{'SOURCE IP':<40} {'TOTAL':>7} {'PASS':>7} {'FAIL':>7} {'PASS%':>7}")
+    w("SENDING SERVICES")
     w("-" * 72)
+    w(f"{'SERVICE':<38} {'SOURCES':>8} {'TOTAL':>8} {'PASS%':>7}")
+    for name, (n_sources, total, passed) in service_breakdown(a):
+        rate = 100.0 * passed / total if total else 0.0
+        w(f"{name:<38.38} {n_sources:>8} {total:>8} {rate:>6.1f}%")
+    w("")
+    w("SOURCES")
+    w("-" * 72)
+    w(f"{'SOURCE IP':<22} {'SERVICE':<24} {'TOTAL':>6} {'PASS':>6} {'FAIL':>6} {'PASS%':>6}")
     for s in sorted(a.sources.values(), key=lambda s: s.total, reverse=True):
         rate = 100.0 * s.dmarc_pass / s.total if s.total else 0.0
-        label = f"{s.ip} {s.hostname}".strip()
-        w(f"{label:<40.40} {s.total:>7} {s.dmarc_pass:>7} {s.fail:>7} {rate:>6.1f}%")
+        label = s.hostname or s.ip
+        w(f"{label:<22.22} {(s.service or '-'):<24.24} {s.total:>6} {s.dmarc_pass:>6} {s.fail:>6} {rate:>5.1f}%")
+        if s.hostname:
+            w(f"    ip: {s.ip}")
         hint = classify_failing_source(s)
         if hint:
             w(f"    -> {hint}")
+    spoofers = suspected_spoofing(a)
+    if spoofers:
+        w("")
+        w("SUSPECTED SPOOFING / ABUSE (no valid authentication at all)")
+        w("-" * 72)
+        for s in spoofers:
+            w(f"{s.ip:<40.40} {s.fail:>7} failed messages")
+        w("p=reject exists to stop exactly this traffic — it strengthens the case "
+          "for tightening once legitimate senders pass.")
     w("")
     w("RECOMMENDATIONS")
     w("-" * 72)
@@ -400,10 +531,20 @@ def render_json(a: Analysis) -> str:
         "total_messages": a.total,
         "dmarc_pass": a.dmarc_pass,
         "pass_rate_pct": round(a.pass_rate, 2),
+        "dkim_aligned": a.dkim_aligned,
+        "spf_aligned": a.spf_aligned,
+        "daily": {str(day): {"total": t, "pass": p}
+                  for day, (t, p) in sorted(a.daily.items())},
+        "services": [
+            {"service": name, "sources": n, "total": total, "pass": passed}
+            for name, (n, total, passed) in service_breakdown(a)
+        ],
+        "suspected_spoofing": [s.ip for s in suspected_spoofing(a)],
         "sources": [
             {
                 "ip": s.ip,
                 "hostname": s.hostname,
+                "service": s.service,
                 "total": s.total,
                 "pass": s.dmarc_pass,
                 "fail": s.fail,
@@ -421,35 +562,90 @@ def render_json(a: Analysis) -> str:
 def render_html(a: Analysis) -> str:
     rate = a.pass_rate
     color = "#2e7d32" if rate >= MIN_PASS_RATE else ("#ef6c00" if rate >= 90 else "#c62828")
+    pct = lambda n: f"{100.0 * n / a.total:.1f}%" if a.total else "-"
+
+    # Daily volume timeline as a stacked CSS bar chart (pass green, fail red).
+    days = sorted(a.daily.items())
+    max_day = max((t for _, (t, _) in days), default=1) or 1
+    bars = []
+    for day, (total, passed) in days:
+        ph = round(118 * passed / max_day)
+        fh = round(118 * (total - passed) / max_day)
+        bars.append(
+            f"<div class='bar' title='{day}: {total} msgs, {passed} pass'>"
+            f"<i class='f' style='height:{fh}px'></i><i class='p' style='height:{ph}px'></i>"
+            f"<span>{day:%m-%d}</span></div>")
+
+    svc_rows = []
+    for name, (n_sources, total, passed) in service_breakdown(a):
+        srate = 100.0 * passed / total if total else 0.0
+        svc_rows.append(f"<tr><td>{html.escape(name)}</td><td class='num'>{n_sources}</td>"
+                        f"<td class='num'>{total}</td><td class='num'>{srate:.1f}%</td></tr>")
+
     rows = []
     for s in sorted(a.sources.values(), key=lambda s: s.total, reverse=True):
         srate = 100.0 * s.dmarc_pass / s.total if s.total else 0.0
         hint = classify_failing_source(s)
         rows.append(
-            "<tr><td>{ip}</td><td>{host}</td><td class='num'>{total}</td>"
+            "<tr><td>{ip}</td><td>{host}</td><td>{svc}</td><td class='num'>{total}</td>"
             "<td class='num'>{p}</td><td class='num'>{f}</td>"
             "<td class='num'>{r:.1f}%</td><td>{hint}</td></tr>".format(
                 ip=html.escape(s.ip), host=html.escape(s.hostname),
+                svc=html.escape(s.service or "-"),
                 total=s.total, p=s.dmarc_pass, f=s.fail, r=srate,
                 hint=html.escape(hint)))
+
+    spoofers = suspected_spoofing(a)
+    threat = ""
+    if spoofers:
+        items = "".join(f"<li><code>{html.escape(s.ip)}</code> — {s.fail} failed messages</li>"
+                        for s in spoofers)
+        threat = (f"<h2>Suspected spoofing / abuse</h2><div class='threat'>"
+                  f"<p>These sources produced failures with <strong>no valid DKIM or SPF at "
+                  f"all</strong> — very unlikely to be your infrastructure. p=reject will "
+                  f"stop them.</p><ul>{items}</ul></div>")
+
     recs = "".join(f"<li>{html.escape(r)}</li>" for r in recommend(a))
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>DMARC analysis — {html.escape(', '.join(a.domains))}</title>
 <style>
- body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 70rem; color: #222; }}
- .banner {{ background: {color}; color: #fff; padding: 1rem 1.5rem; border-radius: 8px; font-size: 1.2rem; }}
- table {{ border-collapse: collapse; width: 100%; margin-top: 1.5rem; }}
+ body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 72rem; color: #222; padding: 0 1rem; }}
+ .cards {{ display: flex; gap: 1rem; flex-wrap: wrap; }}
+ .card {{ flex: 1 1 9rem; border: 1px solid #ddd; border-radius: 10px; padding: .9rem 1.1rem; }}
+ .card b {{ display: block; font-size: 1.6rem; }}
+ .card.hero {{ background: {color}; color: #fff; border: 0; }}
+ .chart {{ display: flex; align-items: flex-end; gap: 4px; height: 150px; margin: 1rem 0;
+           border-bottom: 2px solid #ccc; padding-bottom: 18px; overflow-x: auto; }}
+ .bar {{ display: flex; flex-direction: column-reverse; width: 26px; position: relative; }}
+ .bar i {{ display: block; }}
+ .bar .p {{ background: #2e7d32; }}
+ .bar .f {{ background: #c62828; }}
+ .bar span {{ position: absolute; bottom: -18px; font-size: .6rem; white-space: nowrap; }}
+ table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
  th, td {{ border: 1px solid #ddd; padding: .45rem .7rem; text-align: left; font-size: .9rem; }}
  th {{ background: #f5f5f5; }}
  .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+ .threat {{ border: 1px solid #c62828; border-radius: 10px; padding: .2rem 1.2rem; background: #fff5f5; }}
  ul {{ line-height: 1.6; }}
 </style></head><body>
-<h1>DMARC aggregate report analysis</h1>
-<div class="banner">Pass rate: {rate:.2f}% &nbsp;|&nbsp; {a.total} messages &nbsp;|&nbsp;
- {len(a.reports)} reports over {a.date_span_days:.0f} days &nbsp;|&nbsp; policy: p={html.escape(a.current_policy)}</div>
+<h1>DMARC analysis — {html.escape(', '.join(a.domains) or 'no data')}</h1>
+<div class="cards">
+ <div class="card hero">DMARC pass rate<b>{rate:.2f}%</b></div>
+ <div class="card">Messages<b>{a.total}</b></div>
+ <div class="card">DKIM aligned<b>{pct(a.dkim_aligned)}</b></div>
+ <div class="card">SPF aligned<b>{pct(a.spf_aligned)}</b></div>
+ <div class="card">Policy<b>p={html.escape(a.current_policy)}</b></div>
+ <div class="card">Coverage<b>{a.date_span_days:.0f} days</b></div>
+</div>
+<h2>Daily volume</h2>
+<div class="chart">{''.join(bars) or '<em>no data</em>'}</div>
 <h2>Recommendations</h2><ul>{recs}</ul>
-<h2>Sending sources</h2>
-<table><tr><th>Source IP</th><th>Hostname</th><th>Total</th><th>Pass</th><th>Fail</th><th>Pass %</th><th>Hint</th></tr>
+{threat}
+<h2>Sending services</h2>
+<table><tr><th>Service</th><th>Sources</th><th>Messages</th><th>Pass %</th></tr>
+{''.join(svc_rows)}</table>
+<h2>All sources</h2>
+<table><tr><th>Source IP</th><th>Hostname</th><th>Service</th><th>Total</th><th>Pass</th><th>Fail</th><th>Pass %</th><th>Hint</th></tr>
 {''.join(rows)}</table>
 <p>Generated {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC by dmarc_analyzer.py</p>
 </body></html>"""

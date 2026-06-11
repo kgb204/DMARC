@@ -178,6 +178,56 @@ class RecommendationTests(unittest.TestCase):
         self.assertIn("forwarder", hint)
 
 
+class SenderIntelligenceTests(unittest.TestCase):
+    def test_known_ip_prefix(self):
+        a = da.analyze([da.parse_report(SAMPLE.read_bytes())])
+        self.assertEqual(a.sources["209.85.220.41"].service, "Google Workspace / Gmail")
+
+    def test_unrecognized_signer_labeled_by_domain(self):
+        a = da.analyze([da.parse_report(SAMPLE.read_bytes())])
+        # Signs with its own (unaligned, unknown) domain -> label by that domain
+        self.assertEqual(a.sources["198.51.100.7"].service, "bounce.mailer.example.net")
+
+    def test_signature_match_on_auth_domain(self):
+        s = da.SourceStats(ip="198.51.100.99", auth_domains={"em123.sendgrid.net"})
+        self.assertEqual(da.identify_service(s, {"example.com"}), "SendGrid")
+
+    def test_own_domain_signer_unidentified_without_rdns(self):
+        s = da.SourceStats(ip="198.51.100.50", auth_domains={"example.com"})
+        self.assertEqual(da.identify_service(s, {"example.com"}), "")
+
+    def test_service_breakdown_grouping(self):
+        a = da.analyze([da.parse_report(SAMPLE.read_bytes())])
+        names = [name for name, _ in da.service_breakdown(a)]
+        self.assertIn("Google Workspace / Gmail", names)
+
+    def test_suspected_spoofing(self):
+        a = da.analyze([da.parse_report(make_report_xml(records=[
+            ("192.0.2.1", 50, "pass", "pass"),
+            ("203.0.113.9", 7, "fail", "fail"),
+        ]))])
+        # the failing source's raw auth also failed -> flagged
+        spoofers = da.suspected_spoofing(a)
+        self.assertEqual([s.ip for s in spoofers], ["203.0.113.9"])
+
+    def test_forwarder_not_flagged_as_spoofing(self):
+        a = da.analyze([da.parse_report(SAMPLE.read_bytes())])
+        # 198.51.100.7 fails alignment but has valid raw DKIM (forwarder-like)
+        self.assertEqual(da.suspected_spoofing(a), [])
+
+    def test_daily_timeline(self):
+        DAY = 86400
+        reports = [
+            da.parse_report(make_report_xml(report_id="d1", begin=1700000000,
+                                            end=1700000000 + DAY)),
+            da.parse_report(make_report_xml(report_id="d2", begin=1700000000 + DAY,
+                                            end=1700000000 + 2 * DAY)),
+        ]
+        a = da.analyze(reports)
+        self.assertEqual(len(a.daily), 2)
+        self.assertEqual(sum(t for t, _ in a.daily.values()), 20)
+
+
 class RenderTests(unittest.TestCase):
     def test_text_and_html_and_json_render(self):
         a = da.analyze([da.parse_report(SAMPLE.read_bytes())])

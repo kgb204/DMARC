@@ -11,10 +11,16 @@ mail passes DMARC alignment — otherwise receivers will start rejecting your
 own email. The aggregate XML reports contain that answer, but they're
 unreadable by hand. This tool turns them into:
 
+- **sender intelligence** — sources are grouped into the services actually
+  sending your mail (Google Workspace, Microsoft 365, SendGrid, Mailchimp,
+  Amazon SES, ...), identified from IP ranges, rDNS, and DKIM/SPF domains,
 - a per-source pass/fail breakdown (which IPs send as your domain, and whether
   they authenticate),
 - hints about *why* a source fails (forwarder vs. misconfigured third-party
   sender vs. spoofing),
+- a **suspected spoofing** panel — sources failing with no valid DKIM or SPF
+  at all, i.e. the traffic `p=reject` exists to stop,
+- a **daily volume/compliance timeline** in the HTML dashboard,
 - a concrete recommendation for your next DNS policy step.
 
 ## Requirements
